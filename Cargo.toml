@@ -1,0 +1,25 @@
+[package]
+name = "quick_resume"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "quick_resume"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Wdk_System_Threading",
+] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+lz4_flex = "0.11"
+anyhow = "1"
+thiserror = "1"

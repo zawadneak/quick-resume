@@ -1,0 +1,171 @@
+/// Launch the target executable in a suspended state ready for memory injection.
+///
+/// Phase 3b / 3c of the restore plan:
+///   1. Spawn the process with CREATE_SUSPENDED so it doesn't execute user code.
+///   2. Wait until ntdll + kernel32 are mapped (the loader has initialized).
+///   3. Return the process and thread handles for further patching.
+use std::ffi::OsStr;
+use std::mem;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+};
+use windows::Win32::System::Threading::{
+    CreateProcessW, ResumeThread, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+};
+
+use crate::util::error::{QuickResumeError, Result};
+
+/// Handles returned for the newly launched suspended process.
+pub struct SuspendedProcess {
+    pub process_handle: HANDLE,
+    pub main_thread_handle: HANDLE,
+    pub pid: u32,
+    pub tid: u32,
+}
+
+impl SuspendedProcess {
+    /// Resume the main thread (and all process threads resume naturally).
+    pub fn resume_main_thread(&self) -> Result<()> {
+        let prev = unsafe { ResumeThread(self.main_thread_handle) };
+        if prev == u32::MAX {
+            return Err(QuickResumeError::Other("ResumeThread failed".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedProcess {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.process_handle);
+            let _ = CloseHandle(self.main_thread_handle);
+        }
+    }
+}
+
+/// Spawn `exe_path` with CREATE_SUSPENDED and wait until the OS loader has
+/// mapped ntdll and kernel32 (i.e., the CRT is ready for us to patch memory).
+pub fn launch_suspended(exe_path: &Path) -> Result<SuspendedProcess> {
+    let wide_path = to_wide(exe_path.to_str().unwrap_or(""));
+
+    let mut si = STARTUPINFOW {
+        cb: mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    // CREATE_SUSPENDED (0x00000004)
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    unsafe {
+        CreateProcessW(
+            windows::core::PCWSTR(wide_path.as_ptr()),
+            None,
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(CREATE_SUSPENDED),
+            None,
+            None,
+            &mut si,
+            &mut pi,
+        )?;
+    }
+
+    let proc = SuspendedProcess {
+        process_handle: pi.hProcess,
+        main_thread_handle: pi.hThread,
+        pid: pi.dwProcessId,
+        tid: pi.dwThreadId,
+    };
+
+    println!(
+        "[launch] Spawned PID {} (main TID {}) in suspended state.",
+        proc.pid, proc.tid
+    );
+
+    // Wait for the loader to map system DLLs.
+    wait_for_loader(&proc)?;
+
+    Ok(proc)
+}
+
+/// Poll until ntdll.dll and kernel32.dll appear in the module list.
+/// This means the OS loader has finished its work and the heap is live.
+fn wait_for_loader(proc: &SuspendedProcess) -> Result<()> {
+    // The main thread is suspended, so it can't advance. We briefly resume it
+    // to let the loader run, then suspend again once system DLLs are visible.
+    //
+    // Strategy: resume → sleep 50 ms → check modules → repeat up to 20×.
+    for attempt in 0..20 {
+        unsafe { ResumeThread(proc.main_thread_handle) };
+        thread::sleep(Duration::from_millis(50));
+
+        if loader_ready(proc.pid) {
+            // Suspend the main thread again before we start writing memory.
+            // NtSuspendProcess would be cleaner, but we use SuspendThread on
+            // the main thread here to keep the dependency minimal.
+            use windows::Win32::System::Threading::SuspendThread;
+            unsafe { SuspendThread(proc.main_thread_handle) };
+            println!("[launch] Loader ready after {}×50 ms.", attempt + 1);
+            return Ok(());
+        }
+    }
+
+    Err(QuickResumeError::Other(
+        "Loader did not map system DLLs within 1 second".into(),
+    ))
+}
+
+/// Return true if both ntdll.dll and kernel32.dll are visible in the module list.
+fn loader_ready(pid: u32) -> bool {
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }) else {
+        return false;
+    };
+
+    let mut entry = MODULEENTRY32W {
+        dwSize: mem::size_of::<MODULEENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    let mut has_ntdll = false;
+    let mut has_kernel32 = false;
+
+    unsafe {
+        if Module32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let name = wide_to_string(&entry.szModule);
+                if name.eq_ignore_ascii_case("ntdll.dll") {
+                    has_ntdll = true;
+                }
+                if name.eq_ignore_ascii_case("kernel32.dll") {
+                    has_kernel32 = true;
+                }
+                if has_ntdll && has_kernel32 {
+                    break;
+                }
+                if Module32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+
+    has_ntdll && has_kernel32
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
