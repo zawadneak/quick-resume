@@ -78,7 +78,7 @@ pub fn dump_memory(handle: HANDLE) -> Result<Vec<MemoryRegion>> {
                 let mut buf = vec![0u8; size];
                 let mut bytes_read = 0usize;
 
-                let ok = unsafe {
+                let result = unsafe {
                     ReadProcessMemory(
                         handle,
                         base as *const _,
@@ -88,25 +88,22 @@ pub fn dump_memory(handle: HANDLE) -> Result<Vec<MemoryRegion>> {
                     )
                 };
 
-                match ok {
-                    Ok(_) => {
-                        buf.truncate(bytes_read);
-                        regions.push(MemoryRegion {
-                            base_address: base,
-                            size,
-                            protect,
-                            region_type,
-                            data: buf,
-                        });
-                    }
-                    Err(e) => {
-                        // Some pages may be guard pages or transiently unreadable.
-                        // Log and continue rather than aborting the whole snapshot.
-                        eprintln!(
-                            "[memory] ReadProcessMemory failed at 0x{:016X} ({}), skipping",
-                            base, e
-                        );
-                    }
+                // ERROR_PARTIAL_COPY (0x8007012B): ReadProcessMemory read some
+                // bytes but not all (guard-page boundary). Keep what we got.
+                if bytes_read > 0 {
+                    buf.truncate(bytes_read);
+                    regions.push(MemoryRegion {
+                        base_address: base,
+                        size,
+                        protect,
+                        region_type,
+                        data: buf,
+                    });
+                } else if let Err(e) = result {
+                    eprintln!(
+                        "[memory] ReadProcessMemory failed at 0x{:016X} ({}), skipping",
+                        base, e
+                    );
                 }
             }
         }

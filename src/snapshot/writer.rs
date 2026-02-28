@@ -28,6 +28,9 @@ pub struct SnapshotPayload {
     pub process_name: String,
     pub pid: u32,
     pub timestamp_ms: u64,
+    /// True when the snapshotted process was a 32-bit (WOW64) process.
+    /// Determines whether WOW64_CONTEXT or x64 CONTEXT was used for threads.
+    pub is_wow64: bool,
     pub memory_regions: Vec<MemoryRegion>,
     pub thread_snapshots: Vec<ThreadSnapshot>,
 }
@@ -65,6 +68,7 @@ pub fn write_snapshot(payload: &SnapshotPayload, path: &Path) -> Result<(u64, u6
 pub fn build_payload(
     process_name: &str,
     pid: u32,
+    is_wow64: bool,
     memory_regions: Vec<MemoryRegion>,
     thread_snapshots: Vec<ThreadSnapshot>,
 ) -> SnapshotPayload {
@@ -77,6 +81,7 @@ pub fn build_payload(
         process_name: process_name.to_string(),
         pid,
         timestamp_ms,
+        is_wow64,
         memory_regions,
         thread_snapshots,
     }

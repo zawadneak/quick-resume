@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+    TH32CS_SNAPMODULE, CREATE_TOOLHELP_SNAPSHOT_FLAGS,
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, ResumeThread, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
@@ -103,30 +104,33 @@ fn wait_for_loader(proc: &SuspendedProcess) -> Result<()> {
     // The main thread is suspended, so it can't advance. We briefly resume it
     // to let the loader run, then suspend again once system DLLs are visible.
     //
-    // Strategy: resume → sleep 50 ms → check modules → repeat up to 20×.
-    for attempt in 0..20 {
+    // Strategy: resume → sleep 100 ms → check modules → repeat up to 60× (6 s).
+    // Unity games can be slow to load system DLLs, especially on first launch.
+    use windows::Win32::System::Threading::SuspendThread;
+    for attempt in 0..60 {
         unsafe { ResumeThread(proc.main_thread_handle) };
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(100));
 
         if loader_ready(proc.pid) {
-            // Suspend the main thread again before we start writing memory.
-            // NtSuspendProcess would be cleaner, but we use SuspendThread on
-            // the main thread here to keep the dependency minimal.
-            use windows::Win32::System::Threading::SuspendThread;
             unsafe { SuspendThread(proc.main_thread_handle) };
-            println!("[launch] Loader ready after {}×50 ms.", attempt + 1);
+            println!("[launch] Loader ready after {}×100 ms.", attempt + 1);
             return Ok(());
         }
     }
 
     Err(QuickResumeError::Other(
-        "Loader did not map system DLLs within 1 second".into(),
+        "Loader did not map system DLLs within 6 seconds".into(),
     ))
 }
 
 /// Return true if both ntdll.dll and kernel32.dll are visible in the module list.
+///
+/// TH32CS_SNAPMODULE32 (0x10) is required when a 64-bit tool enumerates
+/// modules of a 32-bit (WOW64) process — without it the list is always empty.
 fn loader_ready(pid: u32) -> bool {
-    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }) else {
+    // 0x08 = TH32CS_SNAPMODULE, 0x10 = TH32CS_SNAPMODULE32
+    let flags = CREATE_TOOLHELP_SNAPSHOT_FLAGS(TH32CS_SNAPMODULE.0 | 0x10);
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(flags, pid) }) else {
         return false;
     };
 

@@ -7,6 +7,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use windows::Win32::Foundation::{BOOL, HANDLE};
+use windows::Win32::System::Threading::IsWow64Process;
+
 use process::{info, open_process_by_name, SuspendGuard};
 use restore::{
     launch::launch_suspended,
@@ -127,15 +130,20 @@ fn cmd_snapshot(target: &str, out: &Path) -> anyhow::Result<()> {
     let regions = dump_memory(proc.handle)?;
     print_stats(&regions);
 
+    let is_wow64 = detect_wow64(proc.handle);
+    if is_wow64 {
+        println!("[snapshot] Detected 32-bit (WOW64) process.");
+    }
+
     println!("[snapshot] Capturing thread contexts ...");
-    let threads = capture_thread_contexts(proc.pid)?;
+    let threads = capture_thread_contexts(proc.pid, is_wow64)?;
     println!("[snapshot] Captured {} thread contexts.", threads.len());
 
     println!("[snapshot] Resuming process ...");
     guard.resume()?;
 
     println!("[snapshot] Serializing and compressing ...");
-    let payload = build_payload(&proc.name, proc.pid, regions, threads);
+    let payload = build_payload(&proc.name, proc.pid, is_wow64, regions, threads);
     let (raw_bytes, compressed_bytes) = write_snapshot(&payload, out)?;
 
     let elapsed = t0.elapsed();
@@ -186,7 +194,7 @@ fn cmd_restore(exe_path: Option<&str>, snap_path: &Path) -> anyhow::Result<()> {
     restore_memory(suspended.process_handle, &payload.memory_regions)?;
 
     println!("[restore] Restoring thread contexts ...");
-    restore_thread_contexts(suspended.pid, &payload.thread_snapshots)?;
+    restore_thread_contexts(suspended.pid, &payload.thread_snapshots, payload.is_wow64)?;
 
     println!("[restore] Resuming process ...");
     suspended.resume_main_thread()?;
@@ -204,6 +212,11 @@ fn cmd_restore(exe_path: Option<&str>, snap_path: &Path) -> anyhow::Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn detect_wow64(handle: HANDLE) -> bool {
+    let mut result = BOOL(0);
+    unsafe { IsWow64Process(handle, &mut result).is_ok() && result.as_bool() }
+}
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
