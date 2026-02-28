@@ -7,8 +7,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     MODULEENTRY32W, THREADENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPTHREAD,
 };
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEM_PRIVATE,
-    PAGE_NOACCESS,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_MAPPED,
 };
 
 use crate::util::error::Result;

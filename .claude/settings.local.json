@@ -5,7 +5,9 @@
       "Bash(cmd.exe /c \"dir /b \"\"C:\\\\Program Files \\(x86\\)\\\\Windows Kits\\\\10\\\\Lib\"\"\")",
       "Bash(cmd.exe /c \"dir /b /s \"\"C:\\\\Program Files \\(x86\\)\\\\Windows Kits\"\" 2>nul | findstr kernel32.lib\")",
       "Bash(cmd.exe /c \"where kernel32.lib 2>nul\")",
-      "Bash(cmd.exe /c \"echo LIB=%LIB%\")"
+      "Bash(cmd.exe /c \"echo LIB=%LIB%\")",
+      "Bash(rustup target add x86_64-pc-windows-gnu)",
+      "Bash(rustup toolchain install stable-x86_64-pc-windows-gnu)"
     ]
   }
 }

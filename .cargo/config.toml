@@ -1,2 +1,3 @@
 [target.x86_64-pc-windows-msvc]
+# Use the MSVC linker directly (avoids GNU link.exe from Git Bash shadowing it)
 linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"

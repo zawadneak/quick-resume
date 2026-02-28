@@ -5,7 +5,7 @@
 use std::mem;
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD,

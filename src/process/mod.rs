@@ -2,5 +2,5 @@ pub mod attach;
 pub mod info;
 pub mod suspend;
 
-pub use attach::{open_process_by_name, ProcessHandle};
+pub use attach::open_process_by_name;
 pub use suspend::SuspendGuard;

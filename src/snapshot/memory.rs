@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_IMAGE,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_READONLY,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE,
+    PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY,
 };
 
-use crate::util::error::{QuickResumeError, Result};
+use crate::util::error::Result;
 
 /// A snapshot of a single contiguous virtual memory region.
 #[derive(Debug, Serialize, Deserialize)]

@@ -66,7 +66,8 @@ pub fn launch_suspended(exe_path: &Path) -> Result<SuspendedProcess> {
     unsafe {
         CreateProcessW(
             windows::core::PCWSTR(wide_path.as_ptr()),
-            None,
+            // lpCommandLine: PWSTR — pass null, we use lpApplicationName instead
+            windows::core::PWSTR(std::ptr::null_mut()),
             None,
             None,
             false,

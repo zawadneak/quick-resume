@@ -3,8 +3,7 @@
 /// IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x0040
 /// Clearing this flag disables ASLR so the executable loads at its preferred
 /// base address on every launch — required for deterministic memory restore.
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs;
 use std::path::Path;
 
 use crate::util::error::{QuickResumeError, Result};
@@ -15,7 +14,7 @@ const PE_MAGIC: u32 = 0x0000_4550; // "PE\0\0"
 
 /// Returns the current DllCharacteristics field value for the given PE file.
 pub fn read_dll_characteristics(path: &Path) -> Result<u16> {
-    let mut data = fs::read(path)?;
+    let data = fs::read(path)?;
     let chars_offset = find_dll_characteristics_offset(&data)?;
     let value = u16::from_le_bytes([data[chars_offset], data[chars_offset + 1]]);
     Ok(value)
