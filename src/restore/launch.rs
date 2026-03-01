@@ -14,7 +14,7 @@ use std::time::Duration;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
-    TH32CS_SNAPMODULE, CREATE_TOOLHELP_SNAPSHOT_FLAGS,
+    TH32CS_SNAPMODULE,
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, ResumeThread, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
@@ -101,18 +101,16 @@ pub fn launch_suspended(exe_path: &Path) -> Result<SuspendedProcess> {
 /// Poll until ntdll.dll and kernel32.dll appear in the module list.
 /// This means the OS loader has finished its work and the heap is live.
 fn wait_for_loader(proc: &SuspendedProcess) -> Result<()> {
-    // The main thread is suspended, so it can't advance. We briefly resume it
-    // to let the loader run, then suspend again once system DLLs are visible.
-    //
-    // Strategy: resume → sleep 100 ms → check modules → repeat up to 60× (6 s).
-    // Unity games can be slow to load system DLLs, especially on first launch.
+    // Strategy: resume 100 ms → suspend → check modules → repeat up to 60× (6 s).
+    // We always suspend before checking so the thread never runs freely on a
+    // failed check — otherwise the process would run unconstrained for 6 seconds.
     use windows::Win32::System::Threading::SuspendThread;
     for attempt in 0..60 {
         unsafe { ResumeThread(proc.main_thread_handle) };
         thread::sleep(Duration::from_millis(100));
+        unsafe { SuspendThread(proc.main_thread_handle) }; // always re-suspend first
 
         if loader_ready(proc.pid) {
-            unsafe { SuspendThread(proc.main_thread_handle) };
             println!("[launch] Loader ready after {}×100 ms.", attempt + 1);
             return Ok(());
         }
@@ -123,14 +121,16 @@ fn wait_for_loader(proc: &SuspendedProcess) -> Result<()> {
     ))
 }
 
-/// Return true if both ntdll.dll and kernel32.dll are visible in the module list.
+/// Return true once the OS loader has initialised enough for memory injection.
 ///
-/// TH32CS_SNAPMODULE32 (0x10) is required when a 64-bit tool enumerates
-/// modules of a 32-bit (WOW64) process — without it the list is always empty.
+/// Uses TH32CS_SNAPMODULE (64-bit modules only) — no SNAPMODULE32 needed:
+///
+///   Native x64 : ntdll.dll + kernel32.dll  — both 64-bit, always visible.
+///   WOW64      : kernel32.dll is 32-bit (SysWOW64) and invisible without
+///                SNAPMODULE32, but wow64cpu.dll is a 64-bit module loaded by
+///                ntdll before any 32-bit code runs — use that instead.
 fn loader_ready(pid: u32) -> bool {
-    // 0x08 = TH32CS_SNAPMODULE, 0x10 = TH32CS_SNAPMODULE32
-    let flags = CREATE_TOOLHELP_SNAPSHOT_FLAGS(TH32CS_SNAPMODULE.0 | 0x10);
-    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(flags, pid) }) else {
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }) else {
         return false;
     };
 
@@ -141,6 +141,7 @@ fn loader_ready(pid: u32) -> bool {
 
     let mut has_ntdll = false;
     let mut has_kernel32 = false;
+    let mut has_wow64cpu = false;
 
     unsafe {
         if Module32FirstW(snap, &mut entry).is_ok() {
@@ -152,7 +153,10 @@ fn loader_ready(pid: u32) -> bool {
                 if name.eq_ignore_ascii_case("kernel32.dll") {
                     has_kernel32 = true;
                 }
-                if has_ntdll && has_kernel32 {
+                if name.eq_ignore_ascii_case("wow64cpu.dll") {
+                    has_wow64cpu = true;
+                }
+                if has_ntdll && (has_kernel32 || has_wow64cpu) {
                     break;
                 }
                 if Module32NextW(snap, &mut entry).is_err() {
@@ -163,7 +167,7 @@ fn loader_ready(pid: u32) -> bool {
         let _ = CloseHandle(snap);
     }
 
-    has_ntdll && has_kernel32
+    has_ntdll && (has_kernel32 || has_wow64cpu)
 }
 
 fn to_wide(s: &str) -> Vec<u16> {

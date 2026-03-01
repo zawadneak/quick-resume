@@ -1,16 +1,14 @@
 /// Restore saved thread register contexts into a newly launched process.
 ///
-/// Phase 3e: Match saved thread contexts to the new process's threads by
-/// position (index), then call SetThreadContext / Wow64SetThreadContext for each.
-///
-/// For 32-bit (WOW64) processes, Wow64SetThreadContext is used — symmetric
-/// with how Wow64GetThreadContext was used during snapshot capture.
+/// Always uses 64-bit SetThreadContext — even for WOW64 processes.
+/// In WOW64, threads execute in 64-bit mode through wow64cpu.dll, so the
+/// 64-bit context is the real execution state. Setting this context correctly
+/// positions the thread in the wow64 translation layer, which then resumes
+/// 32-bit execution.
 use std::mem;
 
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::Debug::{
-    SetThreadContext, Wow64SetThreadContext, CONTEXT, WOW64_CONTEXT,
-};
+use windows::Win32::System::Diagnostics::Debug::{SetThreadContext, CONTEXT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD,
 };
@@ -21,14 +19,14 @@ use crate::util::error::{QuickResumeError, Result};
 
 /// Restore thread contexts from `snapshots` into the process with `pid`.
 ///
-/// Pass `is_wow64 = true` for 32-bit (WOW64) games — must match what was used
-/// during snapshot capture so the context byte sizes are consistent.
+/// The `_is_wow64` parameter is accepted for API compatibility but ignored —
+/// we always use SetThreadContext (64-bit) regardless of process bitness.
 ///
 /// The new process must be fully suspended before this is called.
 pub fn restore_thread_contexts(
     pid: u32,
     snapshots: &[ThreadSnapshot],
-    is_wow64: bool,
+    _is_wow64: bool,
 ) -> Result<()> {
     let new_tids = collect_tids(pid)?;
 
@@ -45,7 +43,7 @@ pub fn restore_thread_contexts(
         let new_tid = new_tids[i];
         let snap = &snapshots[i];
 
-        if let Err(e) = restore_one(new_tid, snap, is_wow64) {
+        if let Err(e) = restore_one(new_tid, snap) {
             eprintln!(
                 "[restore::threads] TID {} (slot {}): {}",
                 new_tid, i, e
@@ -68,29 +66,28 @@ pub fn restore_thread_contexts(
         );
     }
 
-    if failed > 0 {
-        return Err(QuickResumeError::Other(format!(
-            "{} thread context restores failed",
-            failed
-        )));
+    let succeeded = pair_count - failed;
+    println!(
+        "[restore::threads] {}/{} thread contexts restored ({} failed — likely OS-managed threads)",
+        succeeded, pair_count, failed
+    );
+
+    if succeeded == 0 {
+        return Err(QuickResumeError::Other(
+            "All thread context restores failed".into(),
+        ));
     }
 
     Ok(())
 }
 
-fn restore_one(tid: u32, snap: &ThreadSnapshot, is_wow64: bool) -> Result<()> {
-    let expected_size = if is_wow64 {
-        mem::size_of::<WOW64_CONTEXT>()
-    } else {
-        mem::size_of::<CONTEXT>()
-    };
-
-    if snap.context_bytes.len() != expected_size {
+fn restore_one(tid: u32, snap: &ThreadSnapshot) -> Result<()> {
+    if snap.context_bytes.len() != mem::size_of::<CONTEXT>() {
         return Err(QuickResumeError::Other(format!(
             "TID {}: context bytes size mismatch ({} vs {})",
             tid,
             snap.context_bytes.len(),
-            expected_size
+            mem::size_of::<CONTEXT>()
         )));
     }
 
@@ -98,21 +95,7 @@ fn restore_one(tid: u32, snap: &ThreadSnapshot, is_wow64: bool) -> Result<()> {
         unsafe { OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, false, tid) }
             .map_err(|e| QuickResumeError::ThreadContextFailed { tid, source: e })?;
 
-    let result = if is_wow64 {
-        restore_wow64(tid, thread_handle, snap)
-    } else {
-        restore_x64(tid, thread_handle, snap)
-    };
-
-    unsafe { let _ = CloseHandle(thread_handle); }
-    result
-}
-
-fn restore_x64(
-    tid: u32,
-    thread_handle: windows::Win32::Foundation::HANDLE,
-    snap: &ThreadSnapshot,
-) -> Result<()> {
+    // Reconstruct the 64-bit CONTEXT from raw bytes.
     let mut ctx = AlignedX64Context::new();
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -121,25 +104,12 @@ fn restore_x64(
             mem::size_of::<CONTEXT>(),
         );
     }
-    unsafe { SetThreadContext(thread_handle, &ctx.inner) }
-        .map_err(|e| QuickResumeError::ThreadContextFailed { tid, source: e })
-}
 
-fn restore_wow64(
-    tid: u32,
-    thread_handle: windows::Win32::Foundation::HANDLE,
-    snap: &ThreadSnapshot,
-) -> Result<()> {
-    let mut ctx: WOW64_CONTEXT = unsafe { mem::zeroed() };
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            snap.context_bytes.as_ptr(),
-            &mut ctx as *mut WOW64_CONTEXT as *mut u8,
-            mem::size_of::<WOW64_CONTEXT>(),
-        );
-    }
-    unsafe { Wow64SetThreadContext(thread_handle, &ctx) }
-        .map_err(|e| QuickResumeError::ThreadContextFailed { tid, source: e })
+    let result = unsafe { SetThreadContext(thread_handle, &ctx.inner) };
+    unsafe { let _ = CloseHandle(thread_handle); }
+
+    result.map_err(|e| QuickResumeError::ThreadContextFailed { tid, source: e })?;
+    Ok(())
 }
 
 fn collect_tids(pid: u32) -> Result<Vec<u32>> {

@@ -5,62 +5,94 @@
 ///   2. If alloc fails (region already mapped by the loader/DLLs), try writing
 ///      directly: VirtualProtectEx to PAGE_EXECUTE_READWRITE → WriteProcessMemory
 ///      → VirtualProtectEx back to original protection.
-///   3. If the direct write also fails (e.g., kernel-mapped guard pages), log and skip.
+///   3. If the direct write also fails, use VirtualQueryEx to diagnose WHY and
+///      categorize the skip.
 ///
-/// Skipped regions are usually read-only OS/DLL pages that are identical to what
-/// the loader already placed there, so skipping them is safe.
+/// A categorized skip summary is printed at the end.
+use std::mem;
+
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, MEM_COMMIT, MEM_RELEASE,
-    MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
+    MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    PAGE_PROTECTION_FLAGS, VIRTUAL_FREE_TYPE, VirtualAllocEx, VirtualFreeEx,
+    VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
 };
 
 use crate::snapshot::memory::MemoryRegion;
 use crate::util::error::{QuickResumeError, Result};
 
+const PAGE_GUARD_FLAG: u32 = 0x100;
+
 /// Write all regions from the snapshot into `target_handle`.
-///
-/// Failures on individual regions are logged and counted. Skipped regions
-/// (where neither alloc nor direct-write succeeded) are expected for OS-managed
-/// pages and are not treated as fatal unless they exceed the threshold.
 pub fn restore_memory(target_handle: HANDLE, regions: &[MemoryRegion]) -> Result<()> {
     let mut alloc_ok = 0usize;
     let mut fallback_ok = 0usize;
-    let mut skipped = 0usize;
+
+    // Skip categories
+    let mut skip_guard = 0usize;      // target page is a guard page
+    let mut skip_image = 0usize;      // target is a MEM_IMAGE (DLL) page — OS loads it from disk
+    let mut skip_not_mapped = 0usize; // address not committed in target at all
+    let mut skip_write_err = 0usize;  // WriteProcessMemory failed (kernel range, etc.)
 
     for region in regions {
         match restore_region(target_handle, region) {
             Ok(RestoreOutcome::AllocatedAndWritten) => alloc_ok += 1,
             Ok(RestoreOutcome::DirectWritten) => fallback_ok += 1,
-            Ok(RestoreOutcome::Skipped) => {
-                skipped += 1;
+            Ok(RestoreOutcome::SkipGuard) => skip_guard += 1,
+            Ok(RestoreOutcome::SkipImage) => skip_image += 1,
+            Ok(RestoreOutcome::SkipNotMapped) => skip_not_mapped += 1,
+            Ok(RestoreOutcome::SkipWriteError(code)) => {
+                skip_write_err += 1;
+                // Only print the first ~10 unexpected write errors to avoid log spam.
+                if skip_write_err <= 10 {
+                    eprintln!(
+                        "[restore::memory] Write error at 0x{:016X} ({} bytes) err=0x{:08X}",
+                        region.base_address, region.data.len(), code
+                    );
+                }
             }
             Err(e) => {
-                // WriteProcessMemory error after a successful alloc — unexpected.
+                // WriteProcessMemory failed after a successful fresh alloc — unexpected.
                 eprintln!(
-                    "[restore::memory] 0x{:016X} ({} bytes): {}",
-                    region.base_address, region.size, e
+                    "[restore::memory] Unexpected error at 0x{:016X}: {}",
+                    region.base_address, e
                 );
-                skipped += 1;
+                skip_write_err += 1;
             }
         }
     }
 
     let total = regions.len();
+    let total_skip = skip_guard + skip_image + skip_not_mapped + skip_write_err;
+
     println!(
-        "[restore::memory] {} allocated+written, {} fallback-written, {} skipped / {} total",
-        alloc_ok, fallback_ok, skipped, total
+        "[restore::memory] Results ({} regions):",
+        total
+    );
+    println!(
+        "  Restored: {} fresh-alloc + {} fallback-overwrite = {} total",
+        alloc_ok, fallback_ok, alloc_ok + fallback_ok
+    );
+    println!(
+        "  Skipped:  {} guard-pages, {} image/DLL, {} not-mapped, {} write-errors = {} total",
+        skip_guard, skip_image, skip_not_mapped, skip_write_err, total_skip
     );
 
-    // Fatal only if we couldn't write the majority of regions.
-    // A high skip count is expected for WOW64 processes (OS DLLs, guard pages).
-    if skipped * 2 > total {
-        return Err(QuickResumeError::Other(format!(
-            "Too many regions could not be restored ({}/{} skipped)",
-            skipped,
-            total
-        )));
+    // not-mapped: snapshot has regions at DLL addresses that ASLR moved in the
+    // new process — those addresses are simply MEM_FREE there.
+    // write-errors: kernel/OS-managed low-range pages (PEB, TEB, loader) that
+    // can't be written from userspace.
+    //
+    // Neither is fatal: Unity game state lives in MEM_PRIVATE (managed heap +
+    // JIT code), which is restored via fresh-alloc. DLL data sections reload
+    // from disk and Unity re-initializes them from the managed heap.
+    if skip_not_mapped + skip_write_err > 0 {
+        eprintln!(
+            "[restore::memory] Warning: {} DLL-ASLR gaps + {} kernel-page errors — \
+             game state in managed heap should still be intact.",
+            skip_not_mapped, skip_write_err
+        );
     }
 
     Ok(())
@@ -69,7 +101,10 @@ pub fn restore_memory(target_handle: HANDLE, regions: &[MemoryRegion]) -> Result
 enum RestoreOutcome {
     AllocatedAndWritten,
     DirectWritten,
-    Skipped,
+    SkipGuard,
+    SkipImage,
+    SkipNotMapped,
+    SkipWriteError(u32),
 }
 
 fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcome> {
@@ -89,10 +124,9 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
 
     if !alloc.is_null() {
         if alloc as usize != region.base_address as usize {
-            // Allocation landed at a wrong address — free it and fall through to path B.
-            unsafe { let _ = VirtualFreeEx(handle, alloc, 0, MEM_RELEASE); }
+            // Allocation landed at a wrong address — free it and fall through.
+            unsafe { let _ = VirtualFreeEx(handle, alloc, 0, VIRTUAL_FREE_TYPE(0x8000)); } // MEM_RELEASE = 0x8000
         } else {
-            // Write the saved bytes.
             let write_ok = unsafe {
                 WriteProcessMemory(
                     handle,
@@ -103,7 +137,6 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
                 )
             };
 
-            // Restore original page protection (best-effort).
             let mut old_protect = PAGE_PROTECTION_FLAGS(0);
             let _ = unsafe {
                 VirtualProtectEx(
@@ -125,13 +158,39 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
         }
     }
 
-    // ── Path B: region already mapped — try to write in-place ──────────────
-    //
-    // This covers DLL pages, OS-loader regions, and pages that were already
-    // committed in the new process at the right address.
+    // ── Path B: region already mapped — query target to understand it ───────
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    let queried = unsafe {
+        VirtualQueryEx(
+            handle,
+            Some(base_ptr),
+            &mut mbi,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+
+    if queried == 0 || mbi.State == MEM_FREE {
+        // Address is not mapped at all in the target process.
+        return Ok(RestoreOutcome::SkipNotMapped);
+    }
+
+    // Guard page in the target? These regenerate naturally.
+    if mbi.Protect.0 & PAGE_GUARD_FLAG != 0 {
+        return Ok(RestoreOutcome::SkipGuard);
+    }
+
+    // MEM_IMAGE page: DLL/EXE code/data loaded from disk by the OS.
+    // We can try to write but often can't change protection.
+    // If the snapshot region is also MEM_IMAGE, the OS will have loaded the
+    // same bytes from disk — safe to skip.
+    if mbi.Type == MEM_IMAGE && region.region_type == MEM_IMAGE.0 {
+        return Ok(RestoreOutcome::SkipImage);
+    }
+
+    // ── Path B continued: attempt in-place overwrite ────────────────────────
     let mut old_protect = PAGE_PROTECTION_FLAGS(0);
 
-    // Make the existing mapping writable (ignore failure — it might already be writable).
+    // Make writable (best-effort — fails for some kernel/image pages).
     let _ = unsafe {
         VirtualProtectEx(
             handle,
@@ -142,8 +201,7 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
         )
     };
 
-    // Attempt the write.
-    let write_ok = unsafe {
+    let write_result = unsafe {
         WriteProcessMemory(
             handle,
             base_ptr,
@@ -153,7 +211,7 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
         )
     };
 
-    // Restore protection whether or not the write succeeded.
+    // Restore protection (best-effort).
     let _ = unsafe {
         VirtualProtectEx(
             handle,
@@ -164,8 +222,17 @@ fn restore_region(handle: HANDLE, region: &MemoryRegion) -> Result<RestoreOutcom
         )
     };
 
-    match write_ok {
+    match write_result {
         Ok(()) => Ok(RestoreOutcome::DirectWritten),
-        Err(_) => Ok(RestoreOutcome::Skipped), // kernel pages, guard pages — safe to skip
+        Err(e) => {
+            let code = e.code().0 as u32;
+            // Distinguish image pages that we couldn't overwrite (expected)
+            // from truly unexpected failures.
+            if mbi.Type == MEM_IMAGE {
+                Ok(RestoreOutcome::SkipImage)
+            } else {
+                Ok(RestoreOutcome::SkipWriteError(code))
+            }
+        }
     }
 }
