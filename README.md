@@ -118,6 +118,7 @@ quick_resume.exe --restore --exe "C:\Path\To\Game\Game.exe" --out snapshot\game.
 
 - Celeste (32-bit WOW64, MonoGame) — restore completes, process launches. Full game-state recovery is not yet confirmed due to DLL ASLR.
 - Mini Metro (32-bit WOW64, Unity) — restore completes, process launches, Unity crash handler appears. Thread instruction pointers likely point into ASLR-shifted DLL addresses.
+- Kingdom Come Deliverance 1 - snapshots successfully, but upon restoration `Error: LZ4 decompress failed: provided output is too small for the decompressed data, actual 816474308, expected 816474332`
 
 ---
 
